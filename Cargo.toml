@@ -1,0 +1,9 @@
+[package]
+name = "mini-groth16"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+ark-bn254 = "0.5.0"
+ark-ff = "0.5.0"
+regex = "1.11.1"
