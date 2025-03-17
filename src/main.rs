@@ -3,13 +3,15 @@ use std::fs::File;
 use std::io::Read;
 use std::process::exit;
 use std::collections::HashMap;
-use std::{rc, result, vec};
+use std::{rc, result, vec,ops::Mul};
 use regex::Regex;
 use ark_bn254::{Fr,FqConfig,Fq2Config, G1Projective as G, G2Projective as G2};
 use ark_ff::fields::Field;
 use std::str::FromStr;
-
-
+use ark_ec::PrimeGroup;
+use ark_ff::{PrimeField, UniformRand, Zero};
+use ark_poly::{univariate::DensePolynomial, DenseUVPolynomial};
+use rand::rngs::OsRng; 
 
 //Extract coeff from string
 fn get_coeff_var(data:&str)->[String;2]{
@@ -479,12 +481,6 @@ fn parse_circuit(file_name:&str) -> (Vec<HashMap<String,Vec<String>>>,Vec<String
 
 }
 
-// Reads witness
-fn create_matrix(file_name:&str){
-
-
-}
-
 // Get matrix vec mul
 fn get_matrix_vec_mul(matrix:Vec<Vec<Fr>>,s:Vec<Fr>)->Vec<Fr>{
     let mut result:Vec<Fr>= Vec::new();
@@ -500,8 +496,80 @@ fn get_matrix_vec_mul(matrix:Vec<Vec<Fr>>,s:Vec<Fr>)->Vec<Fr>{
 
 }
 
+// Interpolate polynomial
+pub fn lagrange_interpolation_polynomial<F: PrimeField>(points: &[(F, F)]) -> DensePolynomial<F> {
+    let zero = DensePolynomial::from_coefficients_vec(vec![F::zero()]);
+    let one = DensePolynomial::from_coefficients_vec(vec![F::one()]);
+
+    points.iter().enumerate().fold(zero, |acc, (i, &(xi, yi))| {
+        let mut term = one.clone();
+        let mut denominator: F = F::one();
+
+        for (j, &(xj, _)) in points.iter().enumerate() {
+            if i != j {
+                term = term.mul(&DensePolynomial::from_coefficients_vec(vec![-xj, F::one()]));
+                denominator *= xi - xj;
+            }
+        }
+
+        
+        let scalar: F = yi * denominator.inverse().unwrap();
+        acc + term.mul(&DensePolynomial::from_coefficients_vec(vec![scalar,F::zero()]))
+    })
+
+}
+
+// Get polynomials 
+fn get_polynomials(matrix:Vec<Vec<Fr>>) -> Vec<DensePolynomial<ark_ff::Fp<ark_ff::MontBackend<ark_bn254::FrConfig, 4>, 4>>>{
+
+    // Interpolate columns 
+    let no_of_points = matrix.len();
+    let no_of_polynomials = matrix[0].len();
+    let mut poly_list:Vec<DensePolynomial<ark_ff::Fp<ark_ff::MontBackend<ark_bn254::FrConfig, 4>, 4>>> = vec![];
+
+    let mut colno = 0;
+    loop{
+        if colno == no_of_polynomials{
+            break;
+        }
+        let mut point_list:Vec<(Fr,Fr)> = vec![];
+        for (rowindex,row) in matrix.iter().enumerate(){
+            for (colindex,col) in row.iter().enumerate(){
+    
+                if colno == colindex{
+                    let row_num:u8 = rowindex.try_into().unwrap();
+                    let point:(Fr,Fr) = (Fr::from(row_num+1),*col);
+                    point_list.push(point);
+                    // println!("Point: {:?}",point);
+                }
+            }
+        }
+
+        // If a complete list of points interpolate
+        // if colno == no_of_polynomials-1{
+        let res_poly= lagrange_interpolation_polynomial(&point_list);
+        poly_list.push(res_poly);
+
+        colno += 1;
+    }
+
+    poly_list
+
+
+}
+
+// Get power of tau
+fn get_tau_k(tau:Fr,times:usize)->Fr{
+    let mut t_final =Fr::from(1u8);
+    for _ in 0..times{
+        t_final = t_final*tau;
+    }
+    t_final
+
+}
+
 fn main() {
-    let (constraint_list,solution_name_list,coeff_cache) = parse_circuit("./groth.circuit");
+    let (constraint_list,solution_name_list,coeff_cache) = parse_circuit("../groth.circuit");
     let mut l_matrix:Vec<Vec<Fr>> = Vec::new();
     let mut r_matrix:Vec<Vec<Fr>> = Vec::new();
     let mut o_matrix:Vec<Vec<Fr>> = Vec::new();
@@ -560,40 +628,97 @@ fn main() {
     println!("R_matrix: {:?}",r_matrix);
     println!("o _matrix: {:?}",o_matrix);
 
-    let solution_vector = vec![Fr::from(1u8),Fr::from(2u8),Fr::from(1u8),Fr::from(1u8),Fr::from(2u8),Fr::from(1u8),Fr::from(4u8),Fr::from(2u8),Fr::from(6u8),Fr::from(1u8),Fr::from(20u8),Fr::from(40u8),Fr::from(3u8),Fr::from(2u8)];
+    // let solution_vector = vec![Fr::from(1u8),Fr::from(2u8),Fr::from(1u8),Fr::from(1u8),Fr::from(2u8),Fr::from(1u8),Fr::from(4u8),Fr::from(2u8),Fr::from(6u8),Fr::from(1u8),Fr::from(20u8),Fr::from(40u8),Fr::from(3u8),Fr::from(2u8)];
 
-    let l_s = get_matrix_vec_mul(l_matrix.clone(),solution_vector.clone());
-    let r_s = get_matrix_vec_mul(r_matrix.clone(),solution_vector.clone());
-    let o_s = get_matrix_vec_mul(o_matrix.clone(),solution_vector.clone());
+    // let l_s = get_matrix_vec_mul(l_matrix.clone(),solution_vector.clone());
+    // let r_s = get_matrix_vec_mul(r_matrix.clone(),solution_vector.clone());
+    // let o_s = get_matrix_vec_mul(o_matrix.clone(),solution_vector.clone());
 
-    println!("L*S Vector: {:?}",l_s);
-    println!("R*S Vector: {:?}",r_s);
-    println!("O*S Vector: {:?}",o_s);
-
-
-    let t = Fr::from_str("14592161914559516814830937163504850059032242933610689562465469457717205663745").unwrap();
-    let six_fr = Fr::from(6u8);
-    let ans = six_fr *t;
-
-    println!("ANS: {:?}",ans);
+    // println!("L*S Vector: {:?}",l_s);
+    // println!("R*S Vector: {:?}",r_s);
+    // println!("O*S Vector: {:?}",o_s);
 
 
-    // "a":"1",
-    // "b":"1",
-    // "r1":"20",
-    // "c":"2",
-    // "r2":"40",
-    // "e":"1",
-    // "r3":"3",
-    // "f":"4",
-    // "g":"2",
-    // "r4":"2",
-    // "h":"6",
-    // "i":"1",
-    // "r5":"1"
+    // let t = Fr::from_str("14592161914559516814830937163504850059032242933610689562465469457717205663745").unwrap();
+    // let six_fr = Fr::from(6u8);
+    // let ans = six_fr *t;
+
+    // println!("ANS: {:?}",ans);
+
+    //-------------------------------------------------------------------------
+    // QAP
+    let l_polynomial_list = get_polynomials(l_matrix);
+    let r_polynomial_list = get_polynomials(r_matrix);
+    let o_polynomial_list = get_polynomials(o_matrix);
+
+    let n = l_polynomial_list.len();
+
+    // Compute t(x) = (x-1)(x-2)..(x-n)  [Vanishing polynomial]
+    let mut t_polynomial = DensePolynomial::from_coefficients_vec(vec![Fr::from(1)]);
+    for i in 1..=n{
+        let rq:u8 = i.try_into().unwrap();
+        let rq_poly = DensePolynomial::from_coefficients_vec(vec![Fr::from(rq)]);
+        let x_poly = DensePolynomial::from_coefficients_vec(vec![Fr::from(0),Fr::from(1)]); // X
+        let element = x_poly - rq_poly;
+        t_polynomial = t_polynomial.mul(element);
+    }
 
 
-    // println!("Constraint_list: {:?}",constraint_list);
-    // println!("Solution name list: {:?}",solution_name_list);
+    // Trusted setup
+    //Compute random values
+    let mut rng = OsRng;
+    let g1 = G::generator(); //Generator on the curve
+    let g2 = G2::generator(); //Generator on the curve G2projective
+    
+    let alpha = Fr::rand(&mut rng);
+    let beta = Fr::rand(&mut rng);
+    let gamma = Fr::rand(&mut rng);
+    let delta = Fr::rand(&mut rng);
+    let tau = Fr::rand(&mut rng);
+
+    //Commitments
+    let alpha_g1 = g1.mul(alpha); //[alpha]1
+    let beta_g1 = g1.mul(beta); //[beta]1
+    let delta_g1 = g1.mul(delta); //[delta]1
+    let alpha_g2 = g2.mul(alpha); //[alpha]2
+    let gamma_g2 = g2.mul(gamma);//[gamma]2
+    let delta_g2 = g2.mul(delta); //[delta]2
+
+
+    // Compute powers of tau
+    let powtau_one :Vec<Fr>= Vec::new();// [[t^i]1.. ] for i = 0 -> 2n-2
+
+    // Compute powers of tau commitments: [[t^i]1.. ] for i = 0 -> 2n-2
+    for i in 0..=(2*n-2){
+        if i == 0{
+            let tau_0 = Fr::from(1u8);
+            let element = g1.mul(tau_0);
+            powtau_one.push(element);
+        }else{
+            let tau_i = get_tau_k(tau,i);
+            let element = g1.mul(tau_i);
+            powtau_one.push(element);
+        }
+    }
+
+    let powtau_two :Vec<Fr>= Vec::new();// [[t^i]2.. ] for i = 0 -> n-1
+
+    // Compute powers of tau commitments: [[t^i]2.. ] for i = 0 -> n-1
+    for i in 0..=(n-1){
+        if i == 0{
+            let tau_0 = Fr::from(1u8);
+            let element = g2.mul(tau_0);
+            powtau_two.push(element);
+        }else{
+            let tau_i = get_tau_k(tau,i);
+            let element = g2.mul(tau_i);
+            powtau_two.push(element);
+        }
+    }
+
+
+
+
+
 
 }
