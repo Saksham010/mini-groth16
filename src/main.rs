@@ -4,6 +4,7 @@ use std::io::Read;
 use std::process::exit;
 use std::collections::HashMap;
 use std::{rc, result, vec,ops::Mul};
+use ark_poly::polynomial;
 use regex::Regex;
 use ark_bn254::{Fr,FqConfig,Fq2Config, G1Projective as G, G2Projective as G2};
 use ark_ff::fields::Field;
@@ -12,6 +13,73 @@ use ark_ec::PrimeGroup;
 use ark_ff::{PrimeField, UniformRand, Zero};
 use ark_poly::{univariate::DensePolynomial, DenseUVPolynomial};
 use rand::rngs::OsRng; 
+use ark_ec::short_weierstrass::Projective;
+use ark_ff::{Fp, MontBackend,QuadExtField,Fp2ConfigWrapper};
+use ark_serialize::CanonicalSerialize;
+use ark_bn254::g1::Config;
+use ark_bn254::g2::Config as Config2;
+
+//For G1Projective and G2 projective coordinates
+#[derive(Debug)]
+#[derive(Clone)]
+enum ProjectiveCoordinateType{
+    C1(Fp<MontBackend<FqConfig, 4>, 4>),
+    C2(QuadExtField<Fp2ConfigWrapper<Fq2Config>>)
+}
+
+trait ProjectiveCoordinateTypeT{
+    fn serialize_uncomp(&self, serialized_data: &mut Vec<u8>);
+}
+
+impl ProjectiveCoordinateTypeT for ProjectiveCoordinateType{
+
+    fn serialize_uncomp(&self, serialized_data: &mut Vec<u8>) {
+        match self {
+            ProjectiveCoordinateType::C1(val)=>{
+                val.serialize_uncompressed(serialized_data).unwrap();
+            }
+            ProjectiveCoordinateType::C2(val)=>{
+                val.serialize_uncompressed(serialized_data).unwrap();
+
+            }
+        }
+    }
+
+}
+
+//For G1Projective and G2 projective elements
+#[derive(Debug)]
+#[derive(Clone)]
+enum ProjectiveConfigType {
+    GOne(Projective<Config>),
+    GTwo(Projective<Config2>)
+}
+
+trait ProjectiveConfigTypeT {
+    fn get_coordinates(&self)->(ProjectiveCoordinateType,ProjectiveCoordinateType,ProjectiveCoordinateType);
+}
+
+impl ProjectiveConfigTypeT for ProjectiveConfigType {
+    fn get_coordinates(&self)->(ProjectiveCoordinateType,ProjectiveCoordinateType,ProjectiveCoordinateType) {
+
+        match self {
+            ProjectiveConfigType::GOne(point)=>{
+                let x = ProjectiveCoordinateType::C1(point.x);
+                let y = ProjectiveCoordinateType::C1(point.y);
+                let z = ProjectiveCoordinateType::C1(point.z);
+                (x,y,z)
+
+            }
+            ProjectiveConfigType::GTwo(point)=>{
+                let x = ProjectiveCoordinateType::C2(point.x);
+                let y = ProjectiveCoordinateType::C2(point.y);
+                let z = ProjectiveCoordinateType::C2(point.z);
+                (x,y,z)
+            }
+        }
+    }
+    
+}
 
 //Extract coeff from string
 fn get_coeff_var(data:&str)->[String;2]{
@@ -569,7 +637,7 @@ fn get_tau_k(tau:Fr,times:usize)->Fr{
 }
 
 fn main() {
-    let (constraint_list,solution_name_list,coeff_cache) = parse_circuit("../groth.circuit");
+    let (constraint_list,solution_name_list,coeff_cache) = parse_circuit("./groth.circuit");
     let mut l_matrix:Vec<Vec<Fr>> = Vec::new();
     let mut r_matrix:Vec<Vec<Fr>> = Vec::new();
     let mut o_matrix:Vec<Vec<Fr>> = Vec::new();
@@ -686,35 +754,91 @@ fn main() {
 
 
     // Compute powers of tau
-    let powtau_one :Vec<Fr>= Vec::new();// [[t^i]1.. ] for i = 0 -> 2n-2
+    let mut powtau_one :Vec<ProjectiveConfigType>= Vec::new();// [[t^i]1.. ] for i = 0 -> 2n-2
 
     // Compute powers of tau commitments: [[t^i]1.. ] for i = 0 -> 2n-2
     for i in 0..=(2*n-2){
         if i == 0{
             let tau_0 = Fr::from(1u8);
             let element = g1.mul(tau_0);
-            powtau_one.push(element);
+            powtau_one.push(ProjectiveConfigType::GOne(element));
         }else{
             let tau_i = get_tau_k(tau,i);
             let element = g1.mul(tau_i);
-            powtau_one.push(element);
+            powtau_one.push(ProjectiveConfigType::GOne(element));
         }
     }
 
-    let powtau_two :Vec<Fr>= Vec::new();// [[t^i]2.. ] for i = 0 -> n-1
+    let mut powtau_two :Vec<ProjectiveConfigType>= Vec::new();// [[t^i]2.. ] for i = 0 -> n-1
 
     // Compute powers of tau commitments: [[t^i]2.. ] for i = 0 -> n-1
     for i in 0..=(n-1){
         if i == 0{
             let tau_0 = Fr::from(1u8);
             let element = g2.mul(tau_0);
-            powtau_two.push(element);
+            powtau_two.push(ProjectiveConfigType::GTwo(element));
         }else{
             let tau_i = get_tau_k(tau,i);
             let element = g2.mul(tau_i);
-            powtau_two.push(element);
+            powtau_two.push(ProjectiveConfigType::GTwo(element));
         }
+
     }
+
+    //Defaulting [0,out] 0-l => 0-1 and [..] l+1 - m 
+    let l = 1;
+    let mut li_pub_one:Vec<ProjectiveConfigType> = Vec::new(); // [Li(tau)/delta..] for i =0 to l
+    let mut li_prv_one:Vec<ProjectiveConfigType> = Vec::new(); // [Li(tau)/gamma..] for i =l+1 to m
+    let mut li_poly_one:Vec<ProjectiveConfigType> = Vec::new();
+    let mut ri_poly_two:Vec<ProjectiveConfigType> = Vec::new();
+
+    for (l_poly,(r_poly,o_poly)) in l_polynomial_list.clone().iter().zip(r_polynomial_list.iter().zip(o_polynomial_list)){
+            let l_coeffs = l_poly.coeffs();
+            let r_coeffs = r_poly.coeffs();
+            let o_coeffs = o_poly.coeffs();
+            
+            for (coeff_index,(l_coeff,(r_coeff,o_coeff))) in l_coeffs.iter().zip(r_coeffs.iter().zip(o_coeffs)).enumerate(){
+                let l_element = *l_coeff * get_tau_k(tau,coeff_index);
+                let r_element = *r_coeff * get_tau_k(tau,coeff_index);
+                let o_element = *o_coeff * get_tau_k(tau,coeff_index);
+                // Public polynomials 0-l
+                if coeff_index <= l{
+                    let li = (beta*l_element + alpha*r_element+o_element)*gamma.inverse().unwrap();
+                    let li_commit_pub = g1.mul(li);
+                    li_pub_one.push(ProjectiveConfigType::GOne(li_commit_pub));
+                }else{
+                    //Private polynomials l+1 - m
+                    let li = (beta*l_element + alpha*r_element+o_element)*delta.inverse().unwrap();
+                    let li_commit_prv = g1.mul(li);
+                    li_prv_one.push(ProjectiveConfigType::GOne(li_commit_prv));
+                }
+
+                // Li poly 
+                let l_poly_commit_one = g1.mul(l_element);
+                let r_poly_commit_two = g2.mul(r_element);
+                
+                li_poly_one.push(ProjectiveConfigType::GOne(l_poly_commit_one));
+                ri_poly_two.push(ProjectiveConfigType::GTwo(r_poly_commit_two));
+
+            }
+
+    }
+
+
+    //-------------------------------------------------------------------------------------------------------------
+    //Prover
+
+    //Sample random r1 and r2
+
+    //Read the witness json file and sort according to the circuit
+
+
+
+    // for (index,li_poly_commit_one) in li_poly_one.iter().enumerate(){
+
+    //     li_poly_commit_one
+    // }
+
 
 
 
