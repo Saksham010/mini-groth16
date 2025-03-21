@@ -4,20 +4,27 @@ use std::io::Read;
 use std::process::exit;
 use std::collections::HashMap;
 use std::{rc, result, vec,ops::Mul};
+use ark_ec::pairing::Pairing;
 use ark_poly::polynomial;
 use regex::Regex;
-use ark_bn254::{Fr,FqConfig,Fq2Config, G1Projective as G, G2Projective as G2};
+use ark_bn254::{Bn254,Fr,FqConfig,FrConfig,Fq2Config, G1Projective as G, G2Projective as G2};
 use ark_ff::fields::Field;
 use std::str::FromStr;
 use ark_ec::PrimeGroup;
 use ark_ff::{PrimeField, UniformRand, Zero};
 use ark_poly::{univariate::DensePolynomial, DenseUVPolynomial};
+use ark_poly::univariate::DenseOrSparsePolynomial;
 use rand::rngs::OsRng; 
 use ark_ec::short_weierstrass::Projective;
 use ark_ff::{Fp, MontBackend,QuadExtField,Fp2ConfigWrapper};
 use ark_serialize::CanonicalSerialize;
 use ark_bn254::g1::Config;
 use ark_bn254::g2::Config as Config2;
+use serde_json::Value;
+use std::io::Result;
+use std::io::{BufReader};
+
+
 
 //For G1Projective and G2 projective coordinates
 #[derive(Debug)]
@@ -304,7 +311,7 @@ fn validate_operators(split_constraint:&str,delimiter:&str) -> bool{
 //Parses circuit
 fn parse_circuit(file_name:&str) -> (Vec<HashMap<String,Vec<String>>>,Vec<String>,HashMap<String,String>) {
     let path = Path::new(file_name);
-    let file: Result<File, std::io::Error> = File::open(path);
+    let file = File::open(path);
     let mut contents = String::new();
     let res = file.expect("Unable to open").read_to_string(&mut contents);
     let shift_operators = ["+","-","/"];
@@ -636,6 +643,39 @@ fn get_tau_k(tau:Fr,times:usize)->Fr{
 
 }
 
+//Load witness values
+fn load_witness_values(path:&str) -> Result<HashMap<String,Value>>{
+    let file = File::open(path).unwrap();
+    let reader = BufReader::new(file);
+    let witness_values:HashMap<String,Value> = serde_json::from_reader(reader).unwrap();
+    Ok(witness_values)
+}
+
+fn extract_g1_element(element:ProjectiveConfigType)->Projective<Config>{
+    match element {
+        ProjectiveConfigType::GOne(ref elem) => elem.clone(),
+        _ => panic!("Expected GOne element but found a different variant."),
+    }
+}
+fn extract_g2_element(element:ProjectiveConfigType)->Projective<Config2>{
+    match element {
+        ProjectiveConfigType::GTwo(ref elem) => elem.clone(),
+        _ => panic!("Expected GTwo element but found a different variant."),
+    }
+}
+
+// F(X) == Sum i(wi * Fi(X)) 
+fn compute_complete_poly(polynomial_list:Vec<DensePolynomial<Fp<MontBackend<FrConfig, 4>, 4>>>,witness_values:Vec<Fr>) -> DensePolynomial<Fp<MontBackend<ark_bn254::FrConfig, 4>, 4>>{
+
+    // Compute B(X) = Sum i (wi*Ri(x))
+    let mut f_x = DensePolynomial::from_coefficients_vec(vec![Fr::from(0u8)]);//0
+
+    for (f_poly,witness_val) in polynomial_list.iter().zip(witness_values){
+        let witness_poly = DensePolynomial::from_coefficients_vec(vec![witness_val]);
+        f_x = f_x + f_poly*witness_poly;
+    }
+    f_x
+}
 fn main() {
     let (constraint_list,solution_name_list,coeff_cache) = parse_circuit("./groth.circuit");
     let mut l_matrix:Vec<Vec<Fr>> = Vec::new();
@@ -715,11 +755,11 @@ fn main() {
 
     //-------------------------------------------------------------------------
     // QAP
-    let l_polynomial_list = get_polynomials(l_matrix);
+    let l_polynomial_list = get_polynomials(l_matrix.clone());
     let r_polynomial_list = get_polynomials(r_matrix);
     let o_polynomial_list = get_polynomials(o_matrix);
 
-    let n = l_polynomial_list.len();
+    let n = l_matrix.len();
 
     // Compute t(x) = (x-1)(x-2)..(x-n)  [Vanishing polynomial]
     let mut t_polynomial = DensePolynomial::from_coefficients_vec(vec![Fr::from(1)]);
@@ -731,8 +771,9 @@ fn main() {
         t_polynomial = t_polynomial.mul(element);
     }
 
+    println!("Vanishing polynomial: {:?}",t_polynomial);
 
-    // Trusted setup
+    // Trusted setup-------------------------------------
     //Compute random values
     let mut rng = OsRng;
     let g1 = G::generator(); //Generator on the curve
@@ -747,6 +788,7 @@ fn main() {
     //Commitments
     let alpha_g1 = g1.mul(alpha); //[alpha]1
     let beta_g1 = g1.mul(beta); //[beta]1
+    let beta_g2 = g2.mul(beta);
     let delta_g1 = g1.mul(delta); //[delta]1
     let alpha_g2 = g2.mul(alpha); //[alpha]2
     let gamma_g2 = g2.mul(gamma);//[gamma]2
@@ -785,14 +827,47 @@ fn main() {
 
     }
 
+    // T(tau) 
+    let mut t_eval = Fr::from(0u8);
+
+    for (i,t_coeff) in t_polynomial.coeffs().iter().enumerate(){
+        if i == 0{
+            let tau_0 = Fr::from(1u8);
+            let element = *t_coeff*tau_0;
+            t_eval = t_eval + element;
+
+        }else{
+            let tau_i = get_tau_k(tau,i);
+            let element = *t_coeff*tau_i;
+            t_eval = t_eval + element;
+        }
+    }
+
+    // [(ti * T(tau))/delta] for i= 0 -> n-2
+    let mut h_z_g1_list = Vec::new();
+    for i in 0..=(n-2){
+        if i == 0{
+            let tau_0 = Fr::from(1u8);
+            let element = g1.mul(tau_0 * t_eval * delta.inverse().unwrap());
+            h_z_g1_list.push(ProjectiveConfigType::GOne(element));
+        }else{
+            let tau_i = get_tau_k(tau,i);
+            let element = g1.mul(tau_i * t_eval * delta.inverse().unwrap());
+            h_z_g1_list.push(ProjectiveConfigType::GOne(element));
+        }
+
+    }
+
+
     //Defaulting [0,out] 0-l => 0-1 and [..] l+1 - m 
     let l = 1;
-    let mut li_pub_one:Vec<ProjectiveConfigType> = Vec::new(); // [Li(tau)/delta..] for i =0 to l
-    let mut li_prv_one:Vec<ProjectiveConfigType> = Vec::new(); // [Li(tau)/gamma..] for i =l+1 to m
+    let mut li_pub_one:Vec<ProjectiveConfigType> = Vec::new(); // [Li(tau)/gamma..] for i =0 to l
+    let mut li_prv_one:Vec<ProjectiveConfigType> = Vec::new(); // [Li(tau)/delta..] for i =l+1 to m
     let mut li_poly_one:Vec<ProjectiveConfigType> = Vec::new();
     let mut ri_poly_two:Vec<ProjectiveConfigType> = Vec::new();
+    let mut oi_poly_one:Vec<ProjectiveConfigType> = Vec::new();
 
-    for (l_poly,(r_poly,o_poly)) in l_polynomial_list.clone().iter().zip(r_polynomial_list.iter().zip(o_polynomial_list)){
+    for (l_poly,(r_poly,o_poly)) in l_polynomial_list.clone().iter().zip(r_polynomial_list.iter().zip(o_polynomial_list.clone())){
             let l_coeffs = l_poly.coeffs();
             let r_coeffs = r_poly.coeffs();
             let o_coeffs = o_poly.coeffs();
@@ -816,33 +891,166 @@ fn main() {
                 // Li poly 
                 let l_poly_commit_one = g1.mul(l_element);
                 let r_poly_commit_two = g2.mul(r_element);
+                let o_poly_commit_two = g1.mul(o_element);
+
                 
                 li_poly_one.push(ProjectiveConfigType::GOne(l_poly_commit_one));
                 ri_poly_two.push(ProjectiveConfigType::GTwo(r_poly_commit_two));
+                oi_poly_one.push(ProjectiveConfigType::GOne(o_poly_commit_two));
+
 
             }
 
     }
 
-
     //-------------------------------------------------------------------------------------------------------------
     //Prover
 
     //Sample random r1 and r2
+    let r1 = Fr::rand(&mut rng);
+    let r2 = Fr::rand(&mut rng);
+    let r1_delta = delta_g1.mul(r1);
+    let r2_delta = delta_g2.mul(r2);
 
     //Read the witness json file and sort according to the circuit
+    let mut witness_values_json = load_witness_values("./witness.json").unwrap();
+    witness_values_json.insert("1".to_string(), "1".into());
+
+    //Save witness values
+    let mut witness_values:Vec<Fr> = Vec::new();
+
+    for witness_name in solution_name_list.clone(){
+        let does_exist = witness_values_json.contains_key(&witness_name);
+        match does_exist {
+            true =>{
+                let var_value = witness_values_json.get(&witness_name).unwrap();
+                let var_value_str = var_value.as_str().unwrap();
+                let var_value_u8 = var_value_str.parse::<u8>().unwrap();
+                let var_value_fr = Fr::from(var_value_u8);
+                witness_values.push(var_value_fr);
+
+            }
+            false => panic!("Variable: {:?} not found in the witness file",&witness_name)
+        }   
+
+    }
+
+    println!("Witness values: {:?}",witness_values);
+
+    // Compute  [A]1
+    let mut a_commitment_g1 = alpha_g1 + r1_delta;
+
+    // Sum(wi * Li(tau))
+    for (val,witness_val) in li_poly_one.iter().zip(&witness_values){
+        let val_g1 = extract_g1_element(val.clone());
+        let witness_val_g1 = val_g1.mul(witness_val);
+        a_commitment_g1 = a_commitment_g1 + witness_val_g1;
+        
+    }
+
+    // Compute [B]2
+    let mut b_commitment_g2 = beta_g2 + r2_delta;
+
+    // Sum(wi * Ri(tau))
+    for (val,witness_val) in ri_poly_two.iter().zip(&witness_values){
+        let val_g2 = extract_g2_element(val.clone());
+        let witness_val_g2 = val_g2.mul(witness_val);
+        b_commitment_g2 = b_commitment_g2 + witness_val_g2;
+        
+    }
+
+    // Compute [B]1
+    let mut b_commitment_g1 = beta_g1 + r1_delta;
+
+    // Sum(wi * Ri(tau))
+    for (val,witness_val) in ri_poly_two.iter().zip(&witness_values){
+        let val_g1 = extract_g1_element(val.clone());
+        let witness_val_g1 = val_g1.mul(witness_val);
+        b_commitment_g1 = b_commitment_g1 + witness_val_g1;
+        
+    }
+
+    // Compute A(X) = Sum i (wi*Li(x)) , B(X) = Sum i (wi*Ri(x)) , O(X) = Sum i (wi*Oi(x))
+    let a_x = compute_complete_poly(l_polynomial_list.clone(),witness_values.clone());
+    let b_x = compute_complete_poly(r_polynomial_list.clone(),witness_values.clone());
+    let c_x = compute_complete_poly(o_polynomial_list.clone(),witness_values.clone());
+    let p_x = a_x.clone().mul(b_x.clone()) - c_x;
+    let (h_x,rem)= DenseOrSparsePolynomial::from(p_x.clone()).divide_with_q_and_r(&DenseOrSparsePolynomial::from(t_polynomial.clone())).unwrap();
+    // let h_x = p_x.clone()/t_polynomial.clone();
+    // H_X validation
+    if rem.coeffs != []{
+        panic!("Error occured!! H(X) has a remainder.");
+    }
+
+    //Compute [C]1
+    let mut c_commitment_g1 = a_commitment_g1.mul(r2) + b_commitment_g1.mul(r1) - delta_g1.mul(r1*r2);
+
+    // Add (H(tau)T(tau))/delta to [C]1
+    for (h_z_commit,h_x_coeff) in h_z_g1_list.iter().zip(h_x.coeffs()){
+        let h_z_commit_g1 = extract_g1_element((*h_z_commit).clone());
+        c_commitment_g1 = c_commitment_g1 + h_z_commit_g1.mul(h_x_coeff);
+
+    }
+
+    //Get private witness values [l+1 ..m ]
+    let (_,prv_witness_values) = witness_values.split_at(l+1);
+    println!("Private witness values: {:?}",prv_witness_values);
+    // Add (wi*Liprv(tau))/delta to [C]1
+    for (li_commit,witness_val) in li_prv_one.iter().zip(prv_witness_values){
+        let li_commit_g1 = extract_g1_element((*li_commit).clone());
+        let element = li_commit_g1.mul(witness_val);
+        c_commitment_g1 = c_commitment_g1 + element;
+        
+    }
 
 
+    // Verifier
 
-    // for (index,li_poly_commit_one) in li_poly_one.iter().enumerate(){
+    // Read public witness file
+    let public_witness_values_json = load_witness_values("./public_witness.json").unwrap();
+    witness_values_json.insert("1".to_string(), "1".into());
+    //Save witness values
+    let mut public_witness_value:Vec<Fr> = Vec::new();
+    for (index,witness_name) in solution_name_list.iter().enumerate(){
+        if index <= l{
+            let does_exist = public_witness_values_json.contains_key(witness_name);
+            match does_exist {
+                true =>{
+                    let var_value = public_witness_values_json.get(witness_name).unwrap();
+                    let var_value_str = var_value.as_str().unwrap();
+                    let var_value_u8 = var_value_str.parse::<u8>().unwrap();
+                    let var_value_fr = Fr::from(var_value_u8);
+                    public_witness_value.push(var_value_fr);
+    
+                }
+                false => panic!("Variable: {:?} not found in the witness file",&witness_name)
+            }   
+        }
 
-    //     li_poly_commit_one
-    // }
+    }
 
+    println!("Public Witness values: {:?}",public_witness_value);
 
+    // wpubi *Lpub(tau)/gamma  (i = 0->l)
+    let mut public_g1_sum = g1*Fr::from(0u8);
+    // Add (wi*Liprv(tau))/delta to [C]1
+    for (li_commit,witness_val) in li_pub_one.iter().zip(public_witness_value){
+        let li_commit_g1 = extract_g1_element((*li_commit).clone());
+        let element = li_commit_g1.mul(witness_val);
+        public_g1_sum = public_g1_sum + element;
+        
+    }
 
+    //Verification
+    let left_pairing_part = Bn254::pairing(a_commitment_g1, b_commitment_g2);
 
+    let right_pairing_one = Bn254::pairing(alpha_g1, beta_g2);
+    let right_pairing_two = Bn254::pairing(public_g1_sum, gamma_g2);
+    let right_pairing_three = Bn254::pairing(c_commitment_g1, delta_g2);
+    let right_pairing_part = right_pairing_one + right_pairing_two + right_pairing_three;
 
+    assert_eq!(left_pairing_part,right_pairing_part,"Invalid proof!!");
+    println!("Valid proof");
 
 
 }
