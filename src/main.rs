@@ -5,7 +5,7 @@ use std::process::exit;
 use std::collections::HashMap;
 use std::{rc, result, vec,ops::Mul};
 use ark_ec::pairing::Pairing;
-use ark_poly::polynomial;
+use ark_poly::{polynomial, Polynomial};
 use regex::Regex;
 use ark_bn254::{Bn254,Fr,FqConfig,FrConfig,Fq2Config, G1Projective as G, G2Projective as G2};
 use ark_ff::fields::Field;
@@ -671,6 +671,7 @@ fn compute_complete_poly(polynomial_list:Vec<DensePolynomial<Fp<MontBackend<FrCo
     let mut f_x = DensePolynomial::from_coefficients_vec(vec![Fr::from(0u8)]);//0
 
     for (f_poly,witness_val) in polynomial_list.iter().zip(witness_values){
+
         let witness_poly = DensePolynomial::from_coefficients_vec(vec![witness_val]);
         f_x = f_x + f_poly*witness_poly;
     }
@@ -864,44 +865,69 @@ fn main() {
     let mut li_pub_one:Vec<ProjectiveConfigType> = Vec::new(); // [Li(tau)/gamma..] for i =0 to l
     let mut li_prv_one:Vec<ProjectiveConfigType> = Vec::new(); // [Li(tau)/delta..] for i =l+1 to m
     let mut li_poly_one:Vec<ProjectiveConfigType> = Vec::new();
+    let mut ri_poly_one:Vec<ProjectiveConfigType> = Vec::new();
     let mut ri_poly_two:Vec<ProjectiveConfigType> = Vec::new();
     let mut oi_poly_one:Vec<ProjectiveConfigType> = Vec::new();
 
-    for (l_poly,(r_poly,o_poly)) in l_polynomial_list.clone().iter().zip(r_polynomial_list.iter().zip(o_polynomial_list.clone())){
-            let l_coeffs = l_poly.coeffs();
-            let r_coeffs = r_poly.coeffs();
-            let o_coeffs = o_poly.coeffs();
+    println!("--------------------------L_POLYNOMAIL LIST LEN: {:?}",l_polynomial_list.len());
+
+    for (coeff_index,(l_poly,(r_poly,o_poly))) in l_polynomial_list.clone().iter().zip(r_polynomial_list.clone().iter().zip(o_polynomial_list.clone())).enumerate(){
+        let l_coeffs = l_poly.coeffs();
+        let r_coeffs = r_poly.coeffs();
+        let o_coeffs = o_poly.coeffs();
+
+        // Padding coeffecients
+        let max_len = l_coeffs.len().max(r_coeffs.len()).max(o_coeffs.len());
+        let l_coeffs_m = l_coeffs.iter().cloned().chain(std::iter::repeat(Fr::zero())).take(max_len).collect::<Vec<_>>();
+        let r_coeffs_m = r_coeffs.iter().cloned().chain(std::iter::repeat(Fr::zero())).take(max_len).collect::<Vec<_>>();
+        let o_coeffs_m = o_coeffs.iter().cloned().chain(std::iter::repeat(Fr::zero())).take(max_len).collect::<Vec<_>>();
+
+        // println!("Before coeff index: --------------");
+        println!("l_coeffs len: {}, r_coeffs len: {}, o_coeffs len: {}", l_coeffs_m.len(), r_coeffs_m.len(), o_coeffs_m.len());
+
+        //l_elements
+        let mut l_element_eval = Fr::from(0u8); //Li(tau)
+        let mut r_element_eval = Fr::from(0u8); //Ri(tau)
+        let mut o_element_eval = Fr::from(0u8); //Oi(tau)
+
+        for (coeff_index_i,(l_coeff,(r_coeff,o_coeff))) in l_coeffs_m.iter().zip(r_coeffs_m.iter().zip(o_coeffs_m)).enumerate(){
+            let l_element = *l_coeff * get_tau_k(tau,coeff_index_i);
+            let r_element = *r_coeff * get_tau_k(tau,coeff_index_i);
+            let o_element = o_coeff * get_tau_k(tau,coeff_index_i);
             
-            for (coeff_index,(l_coeff,(r_coeff,o_coeff))) in l_coeffs.iter().zip(r_coeffs.iter().zip(o_coeffs)).enumerate(){
-                let l_element = *l_coeff * get_tau_k(tau,coeff_index);
-                let r_element = *r_coeff * get_tau_k(tau,coeff_index);
-                let o_element = *o_coeff * get_tau_k(tau,coeff_index);
-                // Public polynomials 0-l
-                if coeff_index <= l{
-                    let li = (beta*l_element + alpha*r_element+o_element)*gamma.inverse().unwrap();
-                    let li_commit_pub = g1.mul(li);
-                    li_pub_one.push(ProjectiveConfigType::GOne(li_commit_pub));
-                }else{
-                    //Private polynomials l+1 - m
-                    let li = (beta*l_element + alpha*r_element+o_element)*delta.inverse().unwrap();
-                    let li_commit_prv = g1.mul(li);
-                    li_prv_one.push(ProjectiveConfigType::GOne(li_commit_prv));
-                }
+            l_element_eval = l_element_eval + l_element;
+            r_element_eval = r_element_eval + r_element;
+            o_element_eval = o_element_eval + o_element;
 
-                // Li poly 
-                let l_poly_commit_one = g1.mul(l_element);
-                let r_poly_commit_two = g2.mul(r_element);
-                let o_poly_commit_two = g1.mul(o_element);
+        }
+        // Public polynomials 0-l
+        if coeff_index <= l{
+            let li = (beta*l_element_eval + alpha*r_element_eval+o_element_eval)*gamma.inverse().unwrap();
+            let li_commit_pub = g1.mul(li);
+            li_pub_one.push(ProjectiveConfigType::GOne(li_commit_pub));
+        }else{
+            //Private polynomials l+1 - m
+            let li = (beta*l_element_eval + alpha*r_element_eval+o_element_eval)*delta.inverse().unwrap();
+            let li_commit_prv = g1.mul(li);
+            li_prv_one.push(ProjectiveConfigType::GOne(li_commit_prv));
+        }
 
-                
-                li_poly_one.push(ProjectiveConfigType::GOne(l_poly_commit_one));
-                ri_poly_two.push(ProjectiveConfigType::GTwo(r_poly_commit_two));
-                oi_poly_one.push(ProjectiveConfigType::GOne(o_poly_commit_two));
+        // Li poly 
+        let l_poly_commit_one = g1.mul(l_element_eval);
+        let r_poly_commit_one = g1.mul(r_element_eval);
+        let r_poly_commit_two = g2.mul(r_element_eval);
+        let o_poly_commit_one = g1.mul(o_element_eval);
 
-
-            }
+        
+        li_poly_one.push(ProjectiveConfigType::GOne(l_poly_commit_one));
+        ri_poly_one.push(ProjectiveConfigType::GOne(r_poly_commit_one));
+        ri_poly_two.push(ProjectiveConfigType::GTwo(r_poly_commit_two));
+        oi_poly_one.push(ProjectiveConfigType::GOne(o_poly_commit_one));      
 
     }
+    println!("-----------------------------------------");
+    println!("LI_PUB_LEN: {:?}",li_pub_one.len());
+    println!("LI_PRV_LEN: {:?}",li_prv_one.len());
 
     //-------------------------------------------------------------------------------------------------------------
     //Prover
@@ -911,6 +937,7 @@ fn main() {
     let r2 = Fr::rand(&mut rng);
     let r1_delta = delta_g1.mul(r1);
     let r2_delta = delta_g2.mul(r2);
+    let r2_delta_g1 = delta_g1.mul(r2);
 
     //Read the witness json file and sort according to the circuit
     let mut witness_values_json = load_witness_values("./witness.json").unwrap();
@@ -959,28 +986,39 @@ fn main() {
         
     }
 
+
     // Compute [B]1
-    let mut b_commitment_g1 = beta_g1 + r1_delta;
+    let mut b_commitment_g1 = beta_g1 + r2_delta_g1;
 
     // Sum(wi * Ri(tau))
-    for (val,witness_val) in ri_poly_two.iter().zip(&witness_values){
+    for (val,witness_val) in ri_poly_one.iter().zip(&witness_values){
         let val_g1 = extract_g1_element(val.clone());
         let witness_val_g1 = val_g1.mul(witness_val);
         b_commitment_g1 = b_commitment_g1 + witness_val_g1;
         
     }
 
+    println!("Check");
+
+
     // Compute A(X) = Sum i (wi*Li(x)) , B(X) = Sum i (wi*Ri(x)) , O(X) = Sum i (wi*Oi(x))
     let a_x = compute_complete_poly(l_polynomial_list.clone(),witness_values.clone());
     let b_x = compute_complete_poly(r_polynomial_list.clone(),witness_values.clone());
     let c_x = compute_complete_poly(o_polynomial_list.clone(),witness_values.clone());
-    let p_x = a_x.clone().mul(b_x.clone()) - c_x;
+    let p_x = a_x.clone().mul(b_x.clone()) - c_x.clone();
     let (h_x,rem)= DenseOrSparsePolynomial::from(p_x.clone()).divide_with_q_and_r(&DenseOrSparsePolynomial::from(t_polynomial.clone())).unwrap();
     // let h_x = p_x.clone()/t_polynomial.clone();
     // H_X validation
     if rem.coeffs != []{
         panic!("Error occured!! H(X) has a remainder.");
     }
+
+
+    // Check the poylnomials
+    assert_eq!(a_x*b_x - c_x.clone(), h_x.clone()*t_polynomial,"Not equal polynomial evaluation"); // Right till here
+
+
+
 
     //Compute [C]1
     let mut c_commitment_g1 = a_commitment_g1.mul(r2) + b_commitment_g1.mul(r1) - delta_g1.mul(r1*r2);
@@ -1032,14 +1070,17 @@ fn main() {
     println!("Public Witness values: {:?}",public_witness_value);
 
     // wpubi *Lpub(tau)/gamma  (i = 0->l)
-    let mut public_g1_sum = g1*Fr::from(0u8);
-    // Add (wi*Liprv(tau))/delta to [C]1
+    let mut public_g1_sum = G::zero();
+    println!("Pubg1_sum: {:?}",public_g1_sum);
+    // Add (wi*Lipub(tau))/gamma to [C]1
     for (li_commit,witness_val) in li_pub_one.iter().zip(public_witness_value){
         let li_commit_g1 = extract_g1_element((*li_commit).clone());
         let element = li_commit_g1.mul(witness_val);
         public_g1_sum = public_g1_sum + element;
         
     }
+    println!("Pubg1_sum: {:?}",public_g1_sum);
+
 
     //Verification
     let left_pairing_part = Bn254::pairing(a_commitment_g1, b_commitment_g2);
